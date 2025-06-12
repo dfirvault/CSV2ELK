@@ -24,3 +24,6 @@ Intended for DFIR and Incident Response, this is a simple tool that uploads CSV 
 ```bash
 # Requires Python 3.8+
 pip install pandas requests tqdm
+```
+## Example
+![image](https://github.com/user-attachments/assets/559a79a9-fc6c-43c6-b11e-2d3a126fcc5a)
