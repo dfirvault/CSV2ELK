@@ -376,7 +376,7 @@ def main():
         choice = input("Enter choice: ")
 
         if choice == '1':
-            base_name = input("Enter name for new index (SIR / INC or project name): ")
+            base_name = input("Enter name for new index (case or project name): ")
             index_name = create_index_with_mapping(base_name)
             selected_index = index_name
             csv_path = select_csv_file()
