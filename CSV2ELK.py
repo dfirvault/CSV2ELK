@@ -7,46 +7,64 @@ import re
 from tkinter import Tk, filedialog
 from tqdm import tqdm
 from datetime import datetime
+import winreg
 
-# Configuration file path
-CONFIG_FILE = 'elk-config.txt'
+# Registry configuration
+REGISTRY_PATH = r"Software\DFIRVault\CSV2ELK"
+
 # =============== CONFIGURATION ===============
 print("")
-print("Developed by Jacob Wilson - Version 0.1")
+print("Developed by Jacob Wilson - Version 0.2")
 print("dfirvault@gmail.com")
 print("")
 def load_config():
-    """Load configuration from file or return empty values if not exists"""
+    """Load configuration from Windows Registry or return empty values if not exists"""
     config = {
         'ELASTICSEARCH_URL': '',
         'USERNAME': '',
         'PASSWORD': ''
     }
     
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line and '=' in line:
-                    key, value = line.split('=', 1)
-                    key = key.strip()
-                    if key in config:
-                        config[key] = value.strip()
+    try:
+        # Try to open the registry key
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REGISTRY_PATH, 0, winreg.KEY_READ)
+        
+        for value_name in config.keys():
+            try:
+                value, _ = winreg.QueryValueEx(key, value_name)
+                config[value_name] = value
+            except FileNotFoundError:
+                # Value doesn't exist, keep default empty string
+                pass
+        
+        winreg.CloseKey(key)
         return config
-    else:
-        print("⚠️ Configuration file 'elk-config.txt' not found. Please enter your Elasticsearch credentials:")
+        
+    except FileNotFoundError:
+        # Registry key doesn't exist, prompt for credentials
+        print("⚠️ Configuration not found in registry. Please enter your Elasticsearch credentials:")
         config['ELASTICSEARCH_URL'] = input("Elasticsearch URL (e.g., https://hostname:9200): ").strip()
         config['USERNAME'] = input("Username: ").strip()
         config['PASSWORD'] = input("Password: ").strip()
-        print("'elk-config.txt' has been created and stored within the same directory as this script")
+        print("Configuration will be stored in registry: HKCU\\" + REGISTRY_PATH)
         return config
 
 def save_config(url, username, password):
-    """Save configuration to file"""
-    with open(CONFIG_FILE, 'w') as f:
-        f.write(f"ELASTICSEARCH_URL={url}\n")
-        f.write(f"USERNAME={username}\n")
-        f.write(f"PASSWORD={password}\n")
+    """Save configuration to Windows Registry"""
+    try:
+        # Create or open the registry key
+        key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, REGISTRY_PATH, 0, winreg.KEY_WRITE)
+        
+        # Store the values
+        winreg.SetValueEx(key, 'ELASTICSEARCH_URL', 0, winreg.REG_SZ, url)
+        winreg.SetValueEx(key, 'USERNAME', 0, winreg.REG_SZ, username)
+        winreg.SetValueEx(key, 'PASSWORD', 0, winreg.REG_SZ, password)
+        
+        winreg.CloseKey(key)
+        print(f"✅ Configuration saved to registry: HKCU\\{REGISTRY_PATH}")
+        
+    except Exception as e:
+        print(f"❌ Failed to save configuration to registry: {e}")
 
 # Load initial configuration
 config = load_config()
