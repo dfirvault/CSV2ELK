@@ -14,7 +14,7 @@ REGISTRY_PATH = r"Software\DFIRVault\CSV2ELK"
 
 # =============== CONFIGURATION ===============
 print("")
-print("Developed by Jacob Wilson - Version 0.2")
+print("Developed by Jacob Wilson - Version 0.1")
 print("dfirvault@gmail.com")
 print("")
 def load_config():
