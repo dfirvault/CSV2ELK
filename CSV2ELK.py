@@ -1,442 +1,438 @@
-import time
-import requests
-import pandas as pd
+"""CSV2ELK v0.3: strict full-column IP discovery and GeoIP enrichment.
+Requires: pip install pandas requests tqdm
+Windows-only registry configuration. Run with Python on Windows.
+"""
+import ipaddress
 import json
 import os
 import re
-from tkinter import Tk, filedialog
-from tqdm import tqdm
-from datetime import datetime
+import time
+import uuid
 import winreg
+from datetime import datetime, timezone
+from pathlib import Path
+from tkinter import Tk, filedialog
 
-# Registry configuration
+import pandas as pd
+import requests
+from tqdm import tqdm
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 REGISTRY_PATH = r"Software\DFIRVault\CSV2ELK"
+CHUNK_DOCS = 1000
+TIMEOUT = 120
 
-# =============== CONFIGURATION ===============
-print("")
-print("Developed by Jacob Wilson - Version 0.1")
-print("dfirvault@gmail.com")
-print("")
+
 def load_config():
-    """Load configuration from Windows Registry or return empty values if not exists"""
-    config = {
-        'ELASTICSEARCH_URL': '',
-        'USERNAME': '',
-        'PASSWORD': ''
-    }
-    
+    """Preserve the original CSV2ELK registry credential workflow."""
+    cfg = {'ELASTICSEARCH_URL': '', 'USERNAME': '', 'PASSWORD': ''}
     try:
-        # Try to open the registry key
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REGISTRY_PATH, 0, winreg.KEY_READ)
-        
-        for value_name in config.keys():
-            try:
-                value, _ = winreg.QueryValueEx(key, value_name)
-                config[value_name] = value
-            except FileNotFoundError:
-                # Value doesn't exist, keep default empty string
-                pass
-        
-        winreg.CloseKey(key)
-        return config
-        
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REGISTRY_PATH) as key:
+            for name in cfg:
+                try:
+                    cfg[name] = winreg.QueryValueEx(key, name)[0]
+                except FileNotFoundError:
+                    pass
     except FileNotFoundError:
-        # Registry key doesn't exist, prompt for credentials
-        print("⚠️ Configuration not found in registry. Please enter your Elasticsearch credentials:")
-        config['ELASTICSEARCH_URL'] = input("Elasticsearch URL (e.g., https://hostname:9200): ").strip()
-        config['USERNAME'] = input("Username: ").strip()
-        config['PASSWORD'] = input("Password: ").strip()
-        print("Configuration will be stored in registry: HKCU\\" + REGISTRY_PATH)
-        return config
+        print('⚠️ Configuration not found. Enter Elasticsearch connection details.')
+    if not cfg['ELASTICSEARCH_URL']:
+        cfg['ELASTICSEARCH_URL'] = input('Elasticsearch URL: ').strip()
+    if not cfg['USERNAME']:
+        cfg['USERNAME'] = input('Username: ').strip()
+    if not cfg['PASSWORD']:
+        cfg['PASSWORD'] = input('Password: ').strip()
+    return cfg
 
-def save_config(url, username, password):
-    """Save configuration to Windows Registry"""
-    try:
-        # Create or open the registry key
-        key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, REGISTRY_PATH, 0, winreg.KEY_WRITE)
-        
-        # Store the values
-        winreg.SetValueEx(key, 'ELASTICSEARCH_URL', 0, winreg.REG_SZ, url)
-        winreg.SetValueEx(key, 'USERNAME', 0, winreg.REG_SZ, username)
-        winreg.SetValueEx(key, 'PASSWORD', 0, winreg.REG_SZ, password)
-        
-        winreg.CloseKey(key)
-        print(f"✅ Configuration saved to registry: HKCU\\{REGISTRY_PATH}")
-        
-    except Exception as e:
-        print(f"❌ Failed to save configuration to registry: {e}")
 
-# Load initial configuration
-config = load_config()
-ELASTICSEARCH_URL = config['ELASTICSEARCH_URL']
-USERNAME = config['USERNAME']
-PASSWORD = config['PASSWORD']
-# =============== CONFIGURATION ===============
-requests.packages.urllib3.disable_warnings()
+def save_config(cfg):
+    """Maintain backwards compatibility with original HKCU settings."""
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, REGISTRY_PATH, 0, winreg.KEY_WRITE) as key:
+        for name in ('ELASTICSEARCH_URL', 'USERNAME', 'PASSWORD'):
+            winreg.SetValueEx(key, name, 0, winreg.REG_SZ, cfg[name])
 
-DEFAULT_FIELD_MAPPINGS = {
-    "timestamp_field": {"type": "date"}#,
-    #"repo_field": {"type": "keyword"},
-    #"user": {"type": "keyword"},
-    #"status": {"type": "keyword"},
-    #"host": {"type": "keyword"},
-    #"message": {"type": "text"},
-    #"log": {"type": "text"}
-}
-        
-def ensure_elasticsearch_connection():
-    global ELASTICSEARCH_URL, USERNAME, PASSWORD
+
+def connect_elasticsearch():
     while True:
+        cfg = load_config()
+        elastic = Elastic(cfg)
         try:
-            response = requests.get(f"{ELASTICSEARCH_URL}/_cluster/health", auth=(USERNAME, PASSWORD), verify=False, timeout=5)
-            if response.status_code == 200:
-                print(f"✅ Connected to Elasticsearch at {ELASTICSEARCH_URL}")
-                # Save the successful configuration
-                save_config(ELASTICSEARCH_URL, USERNAME, PASSWORD)
-                return True
-            elif response.status_code == 401:
-                print("❌ Authentication failed. Please enter correct credentials.")
-                USERNAME = input("Username: ")
-                PASSWORD = input("Password: ")
-            else:
-                print(f"❌ Error connecting: {response.status_code} - {response.text}")
-                ELASTICSEARCH_URL = input("Enter correct Elasticsearch URL (e.g., https://hostname:9200): ").strip()
-        except requests.exceptions.RequestException as e:
-            print(f"⚠️ Failed to reach Elasticsearch URL ({ELASTICSEARCH_URL}): {e}")
-            ELASTICSEARCH_URL = input("Enter correct Elasticsearch URL (e.g., https://hostname:9200): ").strip()
+            elastic.request('GET', '_cluster/health')
+            save_config(cfg)
+            print(f"✅ Connected to Elasticsearch at {cfg['ELASTICSEARCH_URL']}")
+            return elastic
+        except requests.exceptions.SSLError as exc:
+            print('❌ SSL connection error:', exc)
+            raise
+        except Exception as exc:
+            print('❌ Elasticsearch connection failed:', exc)
+            if input('Re-enter connection details? [Y/n]: ').strip().lower() == 'n':
+                raise
+            # Only clear bad credentials in memory. Original registry values remain
+            # until a successful connection is established.
+            cfg['ELASTICSEARCH_URL'] = input('Elasticsearch URL: ').strip() or cfg['ELASTICSEARCH_URL']
+            cfg['USERNAME'] = input('Username: ').strip() or cfg['USERNAME']
+            cfg['PASSWORD'] = input('Password: ').strip()
+            elastic = Elastic(cfg)
+            try:
+                elastic.request('GET', '_cluster/health')
+                save_config(cfg)
+                return elastic
+            except Exception as exc2:
+                print('❌ Connection still unsuccessful:', exc2)
 
-def get_indices_info():
-    stats_url = f"{ELASTICSEARCH_URL}/_cat/indices?h=index,docs.count,store.size&format=json"
-    response = requests.get(stats_url, auth=(USERNAME, PASSWORD), verify=False)
-    if response.status_code == 200:
-        data = response.json()
-        return [idx for idx in data if not (idx['index'].startswith('.') or idx['index'].startswith('log'))]
-    else:
-        print("Error retrieving index info.")
-        return []
-def extract_date_from_index(index_name):
-    match = re.search(r'_(\d{8})$', index_name)
-    if match:
-        return match.group(1)
-    return '00000000'  # fallback for indexes without date
-    
+
 def sanitize_index_name(name):
-    name = name.lower()
-    name = re.sub(r'\s+', '_', name)
-    name = re.sub(r'[^a-z0-9_]', '', name)
-    return name
+    result = re.sub(r'[^a-z0-9_-]', '', re.sub(r'\s+', '_', name.lower()))
+    if not result or result[0] in '_-+.' or result in ('.', '..'):
+        raise ValueError('Invalid index name')
+    return result
 
-def create_index_with_mapping(index_base_name):
-    index_base_name = sanitize_index_name(index_base_name)
-    today = datetime.today().strftime('%Y%m%d')
-    index_name = f"{index_base_name}_{today}"
-    mapping = {
-        "mappings": {
-            "properties": DEFAULT_FIELD_MAPPINGS
-        }
-    }
-    response = requests.put(
-        f'{ELASTICSEARCH_URL}/{index_name}',
-        auth=(USERNAME, PASSWORD),
-        headers={'Content-Type': 'application/json'},
-        data=json.dumps(mapping),
-        verify=False
-    )
-    if response.status_code == 200:
-        print(f"✅ Index '{index_name}' created with default mappings.")
-    else:
-        print(f"❌ Failed to create index. Status: {response.status_code}, Response: {response.text}")
-    return index_name
-
-def guess_timestamp_column(columns):
-    priority = ['timestamp', '@timestamp', 'time', 'datetime', 'date']
-    for p in priority:
-        for col in columns:
-            if re.search(p, col, re.IGNORECASE):
-                return col
-    return None
-
-def select_timestamp_column(df):
-    print("\nCSV Headers with Sample Values (row 1):")
-    if df.empty:
-        print("⚠️ DataFrame is empty. Cannot determine timestamp column.")
-        return None
-
-    sample_row = df.iloc[0].to_dict()
-    for i, col in enumerate(df.columns, 1):
-        sample_val = sample_row.get(col, '')
-        print(f"{i}. {col} - {sample_val}")
-
-    default_guess = guess_timestamp_column(df.columns)
-    if default_guess:
-        example_val = sample_row.get(default_guess, 'N/A')
-        print(f"\n📌 Suggested timestamp column: {default_guess} (e.g. {example_val})")
-
-    while True:
-        selection = input(f"Select timestamp column, either in Epoch time or ISO-8601 (YYYY-MM-DDTHH:MM:SSZ) [press Enter to accept '{default_guess}']: ")
-        if selection.strip() == '' and default_guess:
-            selected_col = default_guess
-            break
-        try:
-            index = int(selection) - 1
-            selected_col = df.columns[index]
-            break
-        except (IndexError, ValueError):
-            print("❌ Invalid selection. Try again.")
-
-    samples = df[selected_col].dropna().astype(str).head(5).tolist()
-    print(f"\n📋 Sample values from '{selected_col}':")
-    for s in samples:
-        iso_version = None
-        try:
-            num = float(s)
-            # Heuristics: 13-digit is ms, 10-digit is s
-            if len(str(int(num))) >= 13:
-                iso_version = datetime.utcfromtimestamp(num / 1000).isoformat() + "Z"
-            elif len(str(int(num))) == 10:
-                iso_version = datetime.utcfromtimestamp(num).isoformat() + "Z"
-        except:
-            pass
-
-        if iso_version:
-            print(f"  - {s} → {iso_version}")
-        else:
-            print(f"  - {s}")
-    print("🔍 Make sure these are valid ISO-8601 timestamps (or parseable by Elasticsearch).")
-
-    confirm = input("✅ Proceed with this timestamp field? (y/n): ").strip().lower()
-    if confirm != 'y':
-        return select_timestamp_column(df)
-
-    return selected_col
-
-def convert_csv_to_json(csv_path, selected_index, index_name=None, timestamp_column=None):
-    df = pd.read_csv(csv_path, encoding='utf-8', low_memory=False, on_bad_lines='warn')
-    df = df.where(pd.notnull(df), None)
-    print(f"✅ Successfully read CSV with encoding: utf-8")
-    print(f"📄 Writing JSON with index: {selected_index}")
-
-    def deduplicate_columns(columns):
-        seen = {}
-        result = []
-        for col in columns:
-            if col not in seen:
-                seen[col] = 0
-                result.append(col)
-            else:
-                seen[col] += 1
-                result.append(f"{col}_{seen[col]}")
-        return result
-
-    df.columns = deduplicate_columns(df.columns)
-    df.columns = [sanitize_column(col) for col in df.columns]
-
-    json_path = csv_path.replace(".csv", ".json")
-
-    with open(json_path, 'w', encoding='utf-8') as f:
-        for _, row in tqdm(df.iterrows(), total=len(df), desc="🔄 Writing JSON"):
-            action = {"index": {"_index": index_name}}
-            f.write(json.dumps(action, ensure_ascii=False) + "\n")
-
-            row_dict = row.to_dict()
-
-            if timestamp_column and timestamp_column in row_dict:
-                ts_val = row_dict[timestamp_column]
-                if pd.notna(ts_val) and str(ts_val).strip():
-                    try:
-                        # Handle numeric epoch time (seconds or milliseconds)
-                        if isinstance(ts_val, (int, float)) or re.match(r'^\d+(\.\d+)?$', str(ts_val)):
-                            ts_float = float(ts_val)
-                            if ts_float > 1e12:  # likely in milliseconds
-                                iso_ts = datetime.utcfromtimestamp(ts_float / 1000).isoformat() + 'Z'
-                            else:  # assume seconds
-                                iso_ts = datetime.utcfromtimestamp(ts_float).isoformat() + 'Z'
-                        else:
-                            iso_ts = pd.to_datetime(ts_val, utc=True).isoformat()
-                        row_dict["timestamp_field"] = iso_ts
-                    except Exception as e:
-                        print(f"⚠️ Failed to parse timestamp: {ts_val} ({e})")
-
-            # 🧼 Clean up non-JSON-compliant values like NaN and Infinity
-            row_dict = clean_data(row_dict)
-
-            f.write(json.dumps(row_dict, ensure_ascii=False) + "\n")
-
-    return json_path
 
 def sanitize_column(name):
-    name = name.replace('.', '_')
-    name = re.sub(r'[^\w@#]', '_', name)
-    return name
+    return re.sub(r'[^\w@#]', '_', str(name).replace('.', '_'))
 
-def clean_data(obj):
-    """Recursively replace NaN, inf, -inf with None (null in JSON)"""
-    if isinstance(obj, dict):
-        return {k: clean_data(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [clean_data(v) for v in obj]
-    elif isinstance(obj, float):
-        if pd.isna(obj) or obj in (float('inf'), float('-inf')):
-            return None
-    return obj
 
-def upload_to_index(index_name, json_file_path, chunk_size=10000, max_retries=30, retry_delay=1):
-    print("🚀 Uploading data to Elasticsearch in chunks...")
+def deduplicate_columns(columns):
+    counts, output = {}, []
+    for name in columns:
+        base = sanitize_column(name) or 'unnamed'
+        candidate = base
+        while candidate in counts:
+            counts[base] = counts.get(base, 0) + 1
+            candidate = f'{base}_{counts[base]}'
+        counts[candidate] = 0
+        output.append(candidate)
+    return output
 
-    def chunk_file(file_path, chunk_size):
-        with open(file_path, 'r', encoding='utf-8') as f:
-            chunk = []
-            for i, line in enumerate(f, 1):
-                chunk.append(line)
-                if i % chunk_size == 0:
-                    yield ''.join(chunk)
-                    chunk = []
-            if chunk:
-                yield ''.join(chunk)
 
-    success = True
-    chunks = list(chunk_file(json_file_path, chunk_size))
-    for i, chunk in enumerate(tqdm(chunks, desc="📤 Uploading chunks")):
-        for attempt in range(1, max_retries + 1):
-            try:
-                response = requests.post(
-                    f'{ELASTICSEARCH_URL}/{index_name}/_bulk',
-                    auth=(USERNAME, PASSWORD),
-                    headers={'Content-Type': 'application/x-ndjson'},
-                    data=chunk.encode('utf-8'),
-                    verify=False,
-                    timeout=10  # optional: limit wait time
-                )
-                if response.status_code not in [200, 201]:
-                    print(f"❌ Chunk upload failed (attempt {attempt}). Status: {response.status_code}")
-                    print(response.text)
-                    if attempt == max_retries:
-                        success = False
-                    else:
-                        time.sleep(retry_delay)
-                else:
-                    result = response.json()
-                    if result.get("errors"):
-                        print("⚠️ Some items in chunk failed to index:")
-                        for item in result["items"]:
-                            if 'error' in item.get('index', {}):
-                                print(json.dumps(item['index']['error'], indent=2))
-                    if attempt > 1:
-                        print(f"🔁 Retry successful for chunk {i+1} on attempt {attempt}.")
-                    break  # success, exit retry loop
-            except requests.exceptions.RequestException as e:
-                print(f"⚠️ Request failed (attempt {attempt}): {e}")
-                if attempt == max_retries:
-                    success = False
-                else:
-                    time.sleep(retry_delay)
+def is_ip(value):
+    if value is None or pd.isna(value):
+        return False
+    try:
+        ipaddress.ip_address(str(value).strip())
+        return True
+    except ValueError:
+        return False
 
-        if not success:
-            print("🚫 Giving up on current chunk due to repeated failures.")
-            break
 
-    os.remove(json_file_path)
-    if success:
-        print("✅ All chunks uploaded successfully.")
-    else:
-        print("❌ Upload completed with some errors.")
+def detect_ip_fields(df):
+    """Only classify a column if EVERY nonempty value is a standalone IP address.
 
-def delete_index(index_name):
-    response = requests.delete(f'{ELASTICSEARCH_URL}/{index_name}', auth=(USERNAME, PASSWORD), verify=False)
-    if response.status_code == 200:
-        print(f"🗑️ Index '{index_name}' deleted.")
-    else:
-        print(f"❌ Failed to delete index. Status: {response.status_code}, Response: {response.text}")
+    This scans the entire CSV, not a sample. Mixed-content fields are excluded,
+    even if only one row contains a URL, port, CIDR, message, or malformed IP.
+    Empty values are allowed, but at least one valid address is required.
+    """
+    detected = []
+    for field in df.columns:
+        valid = 0
+        invalid_example = None
+        for value in df[field]:
+            if value is None or pd.isna(value) or not str(value).strip():
+                continue
+            if not is_ip(value):
+                invalid_example = str(value)[:100]
+                break
+            valid += 1
+        if invalid_example is None and valid:
+            detected.append(field)
+            print(f'  🌍 IP field: {field} (all {valid:,} nonempty values valid)')
+        elif invalid_example is not None:
+            print(f'  ↪ Skipped {field}: contains non-IP value {invalid_example!r}')
+    return detected
 
-def select_csv_file():
-    print("📂 Reading CSV...")
-    root = Tk()
-    root.withdraw()
-    file_path = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv")])
-    root.destroy()
-    return file_path
 
-def select_index():
-    index_info = get_indices_info()
-    if not index_info:
-        print("⚠️ No eligible indexes found.")
+def guess_timestamp_column(columns):
+    """Original CSV2ELK priority-based timestamp field suggestion."""
+    priority = ['timestamp', '@timestamp', 'time', 'datetime', 'date']
+    for candidate in priority:
+        for column in columns:
+            if re.search(candidate, column, re.IGNORECASE):
+                return column
+    return None
+
+
+def choose_timestamp(df):
+    """Preserve original header preview, sample conversion and confirmation."""
+    if df.empty:
+        print('⚠️ DataFrame is empty. Cannot determine timestamp column.')
         return None
-    
-    # Sort by extracted date from index name (ascending)
-    index_info.sort(key=lambda x: extract_date_from_index(x['index']))
-    
-    print("\nAvailable indexes:")
-    print("0. Return to main menu")
-    for idx, entry in enumerate(index_info, start=1):
-        name = entry['index']
-        docs = f"{int(entry['docs.count']):,}"
-        size = entry['store.size']
-        print(f"{idx}. {name} - {docs} documents - {size}")
+    print('\nCSV Headers with Sample Values (row 1):')
+    first_row = df.iloc[0].to_dict()
+    for i, column in enumerate(df.columns, 1):
+        print(f'{i}. {column} - {first_row.get(column, "")}')
+    guess = guess_timestamp_column(df.columns)
+    if guess:
+        print(f'\n📌 Suggested timestamp column: {guess} (e.g. {first_row.get(guess, "N/A")})')
+    while True:
+        prompt = (f"Select timestamp column, either in Epoch time or ISO-8601 "
+                  f"(YYYY-MM-DDTHH:MM:SSZ) [Enter for '{guess or 'none'}', "
+                  "0 for no timestamp, or field number]: ")
+        choice = input(prompt).strip()
+        if choice == '0':
+            print('⚠️ No timestamp field selected.')
+            return None
+        if not choice and guess:
+            selected = guess
+        elif not choice:
+            print('⚠️ No automatic timestamp match. Select a field number or 0.')
+            continue
+        else:
+            try:
+                number = int(choice)
+                if not 1 <= number <= len(df.columns):
+                    raise ValueError()
+                selected = df.columns[number - 1]
+            except ValueError:
+                print('❌ Invalid selection. Try again.')
+                continue
+        print(f"\n📋 Sample values from '{selected}':")
+        for sample in df[selected].head(5):
+            converted = parse_timestamp(sample)
+            if converted:
+                print(f'  - {sample} → {converted}')
+            else:
+                print(f'  - {sample} (not parsed)')
+        print('🔍 Make sure these timestamps are valid before importing.')
+        confirm = input('✅ Proceed with this timestamp field? (y/n): ').strip().lower()
+        if confirm in ('y', 'yes'):
+            return selected
+        print('↩️ Select a different timestamp field.')
 
-    selected = input("Select an index (number): ")
-    if selected == '0':
+
+def parse_timestamp(value):
+    if value is None or pd.isna(value) or str(value).strip() == '':
         return None
     try:
-        return index_info[int(selected) - 1]['index']
-    except (IndexError, ValueError):
-        print("Invalid selection.")
+        s = str(value).strip()
+        if re.fullmatch(r'\d+(\.\d+)?', s):
+            n = float(s)
+            if n > 1e11:
+                n /= 1000
+            return datetime.fromtimestamp(n, timezone.utc).isoformat()
+        return pd.to_datetime(value, utc=True, errors='raise').isoformat()
+    except (ValueError, TypeError, OverflowError):
         return None
 
-def main():
-    ensure_elasticsearch_connection()
-    while True:
-        print("\n=== Elasticsearch CSV Uploader ===")
-        print("1. Create new index and upload data")
-        print("2. Upload data to existing index")
-        print("3. Manage index (delete)")
-        print("0. Exit")
 
-        choice = input("Enter choice: ")
+def clean_value(value):
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    if pd.isna(value):
+        return None
+    return value.item() if hasattr(value, 'item') else value
 
-        if choice == '1':
-            base_name = input("Enter name for new index (case or project name): ")
-            index_name = create_index_with_mapping(base_name)
-            selected_index = index_name
-            csv_path = select_csv_file()
-            if not csv_path:
-                print("No file selected. Returning to menu.")
-                continue
-            df = pd.read_csv(csv_path, encoding='utf-8', low_memory=False, on_bad_lines='warn')
-            df = df.where(pd.notnull(df), None)
-            timestamp_column = select_timestamp_column(df)
-            json_file = convert_csv_to_json(csv_path, selected_index, index_name=selected_index, timestamp_column=timestamp_column)
-            upload_to_index(selected_index, json_file)
 
-        elif choice == '2':
-            selected_index = select_index()
-            if not selected_index:
-                continue
-            csv_path = select_csv_file()
-            if not csv_path:
-                print("No file selected. Returning to menu.")
-                continue
-            df = pd.read_csv(csv_path, encoding='utf-8', low_memory=False, on_bad_lines='warn')
-            df = df.where(pd.notnull(df), None)
-            timestamp_column = select_timestamp_column(df)
-            json_file = convert_csv_to_json(csv_path, selected_index, index_name=selected_index, timestamp_column=timestamp_column)
-            upload_to_index(selected_index, json_file)
+class Elastic:
+    def __init__(self, cfg):
+        self.url = cfg['ELASTICSEARCH_URL'].rstrip('/')
+        self.session = requests.Session()
+        self.session.auth = (cfg['USERNAME'], cfg['PASSWORD'])
+        self.session.verify = False  # Original lab behaviour; prefer trusted CA for production
+        self.session.headers.update({'Accept': 'application/json'})
 
-        elif choice == '3':
-            selected_index = select_index()
-            if not selected_index:
-                continue
-            confirm = input(f"Are you sure you want to delete '{selected_index}'? (y/n): ")
-            if confirm.lower() in ['y', 'yes']:
-                delete_index(selected_index)
+    def request(self, method, path, **kwargs):
+        r = self.session.request(method, self.url + '/' + path.lstrip('/'), timeout=TIMEOUT, **kwargs)
+        if not r.ok:
+            raise RuntimeError(f'{method} {path}: HTTP {r.status_code}: {r.text[:3000]}')
+        return r.json() if r.content else {}
+
+    def index_exists(self, name):
+        r = self.session.head(self.url + '/' + name, timeout=TIMEOUT)
+        if r.status_code == 404:
+            return False
+        if not r.ok:
+            raise RuntimeError(f'Checking index failed: {r.status_code} {r.text}')
+        return True
+
+
+def pipeline_definition(ip_fields):
+    processors = []
+    for field in ip_fields:
+        # Target names are generated from sanitized CSV column names.
+        processors.append({'geoip': {
+            'field': field,
+            'target_field': f'geoip.{field}',
+            'ignore_missing': True,
+            'ignore_failure': True
+        }})
+    return {'description': 'CSV2ELK per-upload IP geolocation', 'processors': processors}
+
+
+def geo_mapping(ip_fields):
+    props = {'timestamp_field': {'type': 'date'}}
+    if ip_fields:
+        props['geoip'] = {'properties': {field: {'properties': {
+            'location': {'type': 'geo_point'}
+        }} for field in ip_fields}}
+    # Preserve original strings, including invalid/non-IP outliers; only map the derived location.
+    return props
+
+
+def prepare_index(elastic, index_name, ip_fields, new_index):
+    properties = geo_mapping(ip_fields)
+    if new_index:
+        elastic.request('PUT', index_name, json={'mappings': {'properties': properties},
+                                                 'settings': {'number_of_replicas': 0}})
+    else:
+        # Check timestamp mapping even if no IP fields were detected.
+        # Mapping updates cannot change existing field types. Fail before uploading.
+        current = elastic.request('GET', f'{index_name}/_mapping')[index_name]['mappings'].get('properties', {})
+        existing_ts = current.get('timestamp_field', {})
+        if existing_ts and existing_ts.get('type') not in ('date', 'date_nanos'):
+            raise RuntimeError('Existing timestamp_field is not a date mapping; reindex required')
+        if not existing_ts:
+            elastic.request('PUT', f'{index_name}/_mapping', json={'properties': {'timestamp_field': {'type': 'date'}}})
+        if not ip_fields:
+            return
+        geo = current.get('geoip', {})
+        if geo and geo.get('type') not in (None, 'object'):
+            raise RuntimeError('Existing geoip field is not an object. Choose a different index.')
+        existing_fields = geo.get('properties', {})
+        for field in ip_fields:
+            loc = existing_fields.get(field, {}).get('properties', {}).get('location', {})
+            if loc and loc.get('type') != 'geo_point':
+                raise RuntimeError(f'geoip.{field}.location is not geo_point in existing index')
+        elastic.request('PUT', f'{index_name}/_mapping', json={'properties': {'geoip': properties['geoip']}})
+
+
+def upload_csv(elastic, csv_path, index_name, new_index):
+    # Read as strings so addresses (including IPv6) and forensic identifiers are not coerced.
+    df = pd.read_csv(csv_path, dtype=str, keep_default_na=False, low_memory=False, on_bad_lines='warn')
+    if df.empty:
+        raise ValueError('CSV has no rows')
+    df.columns = deduplicate_columns(df.columns)
+    print(f'✅ Loaded {len(df):,} rows, {len(df.columns)} fields')
+    timestamp = choose_timestamp(df)
+    if timestamp:
+        print('✅ Timestamp mapping: timestamp_field (date), sourced from ' + timestamp)
+    ip_fields = detect_ip_fields(df)
+    if ip_fields:
+        print('🌍 Strictly validated IP columns:', ', '.join(ip_fields))
+    else:
+        print('⚠️ No exclusively-IP columns detected; importing without GeoIP enrichment')
+    if input('Continue with these fields? [Y/n]: ').strip().lower() == 'n':
+        return
+
+    # Each upload has its own pipeline; mapping is index-wide and extended per upload.
+    pipeline_id = f'csv2elk_geoip_{index_name}_{uuid.uuid4().hex[:8]}' if ip_fields else None
+    if pipeline_id:
+        elastic.request('PUT', f'_ingest/pipeline/{pipeline_id}', json=pipeline_definition(ip_fields))
+        print('✅ Created GeoIP pipeline:', pipeline_id)
+    prepare_index(elastic, index_name, ip_fields, new_index)
+    print('✅ Index mapping ready')
+
+    indexed, failed = 0, 0
+    for offset in tqdm(range(0, len(df), CHUNK_DOCS), desc='📤 Uploading CSV'):
+        rows = df.iloc[offset:offset + CHUNK_DOCS]
+        lines = []
+        for record in rows.to_dict(orient='records'):
+            record = {k: clean_value(v) for k, v in record.items()}
+            if timestamp:
+                parsed = parse_timestamp(record.get(timestamp))
+                if parsed:
+                    record['timestamp_field'] = parsed
+            # Preserve original evidence values, including malformed IPs.
+            # GeoIP ignore_failure skips values it cannot enrich.
+            lines.append(json.dumps({'index': {'_index': index_name}}, ensure_ascii=False))
+            lines.append(json.dumps(record, ensure_ascii=False, default=str))
+        body = ('\n'.join(lines) + '\n').encode('utf-8')
+        params = {'pipeline': pipeline_id} if pipeline_id else {}
+        result = elastic.request('POST', '_bulk', params=params, data=body,
+                                 headers={'Content-Type': 'application/x-ndjson'})
+        for item in result.get('items', []):
+            detail = item.get('index', {})
+            if detail.get('error') or detail.get('status', 500) >= 300:
+                failed += 1
+                if failed <= 10:
+                    print('❌ Indexing error:', json.dumps(detail.get('error', detail)))
             else:
-                print("Cancelled.")
+                indexed += 1
+    print(f"{'✅' if failed == 0 else '⚠️'} Upload finished: {indexed:,} indexed, {failed:,} failed")
+    if pipeline_id:
+        print(f'✅ Pipeline retained: {pipeline_id}')
+        print('🌍 Geo locations: ' + ', '.join(f'geoip.{f}.location' for f in ip_fields))
+    if failed:
+        print('⚠️ WARNING: Some documents failed; investigate errors before re-uploading.')
 
-        elif choice == '0':
-            print("Goodbye!")
+
+def select_index(elastic):
+    indices = elastic.request('GET', '_cat/indices?format=json&h=index,docs.count,store.size')
+    indices = [i for i in indices if not i['index'].startswith('.') and not i['index'].startswith('log')]
+    indices.sort(key=lambda item: item['index'])
+    if not indices:
+        print('⚠️ No eligible indices found.')
+        return None
+    print('\nAvailable indexes:')
+    print('0. Return to main menu')
+    for n, item in enumerate(indices, 1):
+        print(f'{n}. {item["index"]} - {item.get("docs.count", "?")} documents - {item.get("store.size", "?")}')
+    try:
+        selected = int(input('Select an index (number): '))
+        if selected == 0:
+            return None
+        return indices[selected - 1]['index'] if 1 <= selected <= len(indices) else None
+    except ValueError:
+        print('❌ Invalid selection')
+        return None
+
+
+def select_csv_file():
+    root = Tk()
+    root.withdraw()
+    path = filedialog.askopenfilename(filetypes=[('CSV files', '*.csv')])
+    root.destroy()
+    return path
+
+
+def main():
+    print('')
+    print('Developed by Jacob Wilson - Version 0.3')
+    print('dfirvault@gmail.com')
+    print('')
+    elastic = connect_elasticsearch()
+    while True:
+        print('\n=== Elasticsearch CSV Uploader ===')
+        print('1. Create new index and upload data')
+        print('2. Upload data to existing index')
+        print('3. Manage index (delete)')
+        print('0. Exit')
+        choice = input('Enter choice: ').strip()
+        if choice == '0':
+            print('👋 Goodbye!')
             break
+        if choice == '3':
+            name = select_index(elastic)
+            if name and input(f'Are you sure you want to delete {name}? (y/n): ').lower() in ('y', 'yes'):
+                elastic.request('DELETE', name)
+                print(f'🗑️ Deleted {name}')
+            continue
+        if choice not in ('1', '2'):
+            print('❌ Invalid choice')
+            continue
+        try:
+            if choice == '1':
+                base = sanitize_index_name(input('Enter name for new index (case or project name): ').strip())
+                name = f'{base}_{datetime.now().strftime("%Y%m%d")}'
+                if elastic.index_exists(name):
+                    print(f'⚠️ Index {name} already exists. Use option 2.')
+                    continue
+                new_index = True
+            else:
+                name = select_index(elastic)
+                if not name:
+                    continue
+                new_index = False
+            path = select_csv_file()
+            if not path:
+                print('⚠️ No file selected. Returning to menu.')
+                continue
+            upload_csv(elastic, path, name, new_index)
+        except Exception as exc:
+            print(f'❌ UPLOAD STOPPED: {exc}')
 
-        else:
-            print("Invalid choice.")
 
 if __name__ == '__main__':
     main()
