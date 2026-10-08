@@ -1,4 +1,4 @@
-"""CSV2ELK v0.4: strict IP discovery, GeoIP, timestamp and Kibana Data Views.
+"""CSV2ELK v0.5: strict IP discovery, GeoIP, timestamp and Kibana Data Views.
 Requires: pip install pandas requests tqdm
 Windows-only registry configuration. Run with Python on Windows.
 """
@@ -398,94 +398,90 @@ def ask_number(prompt, count, allow_zero=True):
 
 
 def offer_data_view(elastic, index_name):
-    """Optional Kibana Data View workflow; failures never roll back uploaded evidence."""
-    print(f'\n🔎 Kibana Data View setup for {index_name}')
-    print('1. Select an existing Data View')
-    print('2. Create a new Data View')
-    print('0. Skip')
-    choice = ask_number('Select an option: ', 2)
-    if choice == 0:
-        return
+    """Automatically find a matching Kibana Data View, or offer to create one.
 
-    default_url = kibana_url_from_elasticsearch(elastic)
+    This is a post-upload convenience operation. Errors never roll back data.
+    """
+    print(f'\n🔎 Checking Kibana Data Views for {index_name}')
+    print('ℹ️ A Kibana Data View is required to see uploaded data in the Discover analytics workspace.')
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REGISTRY_PATH) as key:
-            default_url = winreg.QueryValueEx(key, 'KIBANA_URL')[0] or default_url
+            kibana_url = str(winreg.QueryValueEx(key, 'KIBANA_URL')[0]).strip().rstrip('/')
     except (FileNotFoundError, OSError):
-        pass
-    kibana_url = input(f'Kibana URL [{default_url}]: ').strip() or default_url
+        print('❌ Kibana URL is missing from the registry configuration.')
+        print(r'   Expected: HKCU\Software\DFIRVault\CSV2ELK -> KIBANA_URL')
+        print('⚠️ Upload succeeded; Data View check was skipped.')
+        return
+    if not kibana_url.startswith(('http://', 'https://')):
+        print('❌ Invalid KIBANA_URL in registry. Data View check skipped.')
+        return
+
     try:
-        # Reuse the working Elasticsearch credentials/session; Kibana may have separate auth.
-        data = kibana_request(elastic, kibana_url, 'GET', 'data_views')
-        views = data.get('data_view', [])
+        response = kibana_request(elastic, kibana_url, 'GET', 'data_views')
+        views = response.get('data_view', [])
         if not isinstance(views, list):
             raise RuntimeError('Unexpected Kibana Data Views API response')
     except Exception as exc:
-        print(f'❌ Cannot retrieve Kibana Data Views: {exc}')
-        print('⚠️ Your CSV upload is unaffected. Check the Kibana URL, credentials and permissions.')
+        print(f'❌ Unable to query existing Kibana Data Views: {exc}')
+        print('⚠️ Uploaded documents remain in Elasticsearch. Check Kibana permissions and connectivity.')
         return
 
-    try:
-        if choice == 1:
-            if not views:
-                print('⚠️ No existing Data Views found. Switching to creation.')
-                choice = 2
-            else:
-                print('\nExisting Kibana Data Views:')
-                for i, view in enumerate(views, 1):
-                    pattern = view.get('title', '')
-                    status = '✅ MATCH' if view_matches_index(pattern, index_name) else '❌ NO MATCH'
-                    print(f"{i}. {view.get('name') or pattern} [{pattern}] — {status}")
-                selected = ask_number('Select a Data View (0 to cancel): ', len(views))
-                if selected == 0:
-                    return
-                view = views[selected - 1]
-                pattern = view.get('title', '')
-                if view_matches_index(pattern, index_name):
-                    print(f'✅ Existing Data View {pattern!r} includes index {index_name!r}.')
-                    print('🔎 Open Kibana Discover and select that Data View.')
-                    return
-                print(f'⚠️ Data View {pattern!r} does NOT match index {index_name!r}.')
-                print('The uploaded documents will not appear through this Data View.')
-                if input('Create a new Data View for this index instead? [Y/n]: ').strip().lower() == 'n':
-                    return
-                choice = 2
+    matches = [v for v in views if view_matches_index(v.get('title', ''), index_name)]
+    if matches:
+        # Prefer an exact index, then a case-specific prefix, then general wildcards.
+        def specificity(view):
+            patterns = [x.strip() for x in view.get('title', '').split(',')
+                        if x.strip() and not x.strip().startswith('-')]
+            relevant = [x for x in patterns if fnmatch.fnmatchcase(index_name, x)]
+            return max(((int(x == index_name), len(x.replace('*', '').replace('?', '')),
+                         -x.count('*') - x.count('?')) for x in relevant),
+                       default=(0, 0, 0))
 
-        if choice == 2:
-            existing_exact = next((v for v in views if v.get('title') == index_name), None)
-            if existing_exact:
-                print(f'✅ An exact-match Data View already exists: {existing_exact.get("name") or index_name}')
-                return
-            suggested = index_name
-            pattern = input(f'Index pattern [{suggested}]: ').strip() or suggested
-            if not view_matches_index(pattern, index_name):
-                print(f'❌ Pattern {pattern!r} does not match {index_name!r}. No Data View created.')
-                return
-            name = input(f'Data View name [{index_name}]: ').strip() or index_name
-            # timestamp_field is the normalized date produced by the existing uploader.
-            timestamp_mapping = elastic.request('GET', f'{index_name}/_mapping')
-            props = timestamp_mapping.get(index_name, {}).get('mappings', {}).get('properties', {})
-            has_timestamp = props.get('timestamp_field', {}).get('type') in ('date', 'date_nanos')
-            body = {'data_view': {'title': pattern, 'name': name}}
-            if has_timestamp:
-                print('📅 Timestamp field: timestamp_field')
-                body['data_view']['timeFieldName'] = 'timestamp_field'
-            else:
-                print('⚠️ No timestamp_field date mapping; creating Data View without a time filter.')
-            if input(f'Create Data View {name!r} with pattern {pattern!r}? [Y/n]: ').strip().lower() == 'n':
-                return
-            created = kibana_request(elastic, kibana_url, 'POST', 'data_views/data_view', json=body)
-            view_id = created.get('data_view', {}).get('id', '(ID not returned)')
-            print(f'✅ Created Kibana Data View: {name} (ID: {view_id})')
-            print(f'✅ Confirmed index pattern {pattern!r} matches {index_name!r}.')
-            print('🔎 Open Kibana Discover and select your new Data View.')
-        try:
-            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, REGISTRY_PATH, 0, winreg.KEY_WRITE) as key:
-                winreg.SetValueEx(key, 'KIBANA_URL', 0, winreg.REG_SZ, kibana_url)
-        except OSError:
-            print('⚠️ Could not save Kibana URL to registry.')
+        best = max(matches, key=specificity)
+        name = best.get('name') or best.get('title')
+        print(f'✅ Existing Kibana Data View found: {name} (pattern: {best.get("title")})')
+        print(f'✅ Confirmed pattern includes index: {index_name}')
+        if len(matches) > 1:
+            print(f'ℹ️ {len(matches)} matching Data Views found; showing the most specific match.')
+        print(f'🔎 In Kibana → Analytics → Discover, make sure the Data View "{name}" is selected.')
+        print('ℹ️ If documents are missing, check the Discover time filter and timestamp field.')
+        return
+
+    print(f'⚠️ No existing Kibana Data View matches index {index_name}.')
+    print('ℹ️ Create a Data View to see the uploaded data in Kibana Discover.')
+    print('   Example: an index named case0001_20261008 can use pattern case*')
+    print('   That pattern will also include future indices beginning with case.')
+    if input('Would you like to create a Data View now? [Y/n]: ').strip().lower() in ('n', 'no'):
+        print('ℹ️ You can create one later in Kibana → Stack Management → Data Views.')
+        return
+
+    suggested = index_name
+    pattern = input(f'Index pattern [{suggested}] (e.g. case*): ').strip() or suggested
+    if not view_matches_index(pattern, index_name):
+        print(f'❌ Pattern {pattern!r} does not match index {index_name!r}.')
+        print('⚠️ No Data View created; choose an exact index name or a matching wildcard.')
+        return
+    name = input(f'Data View name [{index_name}]: ').strip() or index_name
+    try:
+        mapping = elastic.request('GET', f'{index_name}/_mapping')
+        props = mapping.get(index_name, {}).get('mappings', {}).get('properties', {})
+        has_timestamp = props.get('timestamp_field', {}).get('type') in ('date', 'date_nanos')
+        body = {'data_view': {'title': pattern, 'name': name}}
+        if has_timestamp:
+            body['data_view']['timeFieldName'] = 'timestamp_field'
+            print('📅 Timestamp field: timestamp_field')
+        else:
+            print('⚠️ No timestamp_field date mapping found; creating without a time filter.')
+        if input(f'Create Data View {name!r} with pattern {pattern!r}? [Y/n]: ').strip().lower() in ('n', 'no'):
+            print('ℹ️ Data View creation cancelled.')
+            return
+        created = kibana_request(elastic, kibana_url, 'POST', 'data_views/data_view', json=body)
+        view_id = created.get('data_view', {}).get('id', '(ID not returned)')
+        print(f'✅ Created Kibana Data View: {name} (ID: {view_id})')
+        print(f'✅ Confirmed index pattern {pattern!r} matches {index_name!r}.')
+        print(f'🔎 Open Kibana Discover and select the Data View "{name}".')
     except Exception as exc:
-        print(f'❌ Kibana Data View operation failed: {exc}')
+        print(f'❌ Kibana Data View creation failed: {exc}')
         print('⚠️ Uploaded documents remain in Elasticsearch.')
 
 
@@ -520,7 +516,7 @@ def select_csv_file():
 
 def main():
     print('')
-    print('Developed by Jacob Wilson - Version 0.6')
+    print('Developed by Jacob Wilson - Version 0.8')
     print('dfirvault@gmail.com')
     print('')
     elastic = connect_elasticsearch()
