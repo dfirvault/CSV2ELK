@@ -601,7 +601,7 @@ def select_csv_file():
 
 def main():
     print('')
-    print('Developed by Jacob Wilson - Version 0.8')
+    print('Developed by Jacob Wilson - Version 0.6')
     print('dfirvault@gmail.com')
     print('')
     elastic = connect_elasticsearch()
