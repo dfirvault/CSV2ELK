@@ -290,7 +290,7 @@ def prepare_index(elastic, index_name, ip_fields, new_index):
         if existing_ts and existing_ts.get('type') not in ('date', 'date_nanos'):
             raise RuntimeError('Existing timestamp_field is not a date mapping; reindex required')
         if not existing_ts:
-            elastic.request('PUT', f'{index_name}/_mapping', json={'properties': {'timestamp_field': {'type': 'date'}})
+            elastic.request('PUT', f'{index_name}/_mapping', json={'properties': {'timestamp_field': {'type': 'date'}}})
         if not ip_fields:
             return
         geo = current.get('geoip', {})
