@@ -1,6 +1,10 @@
-"""CSV2ELK v0.5: strict IP discovery, GeoIP, timestamp and Kibana Data Views.
+"""CSV2ELK v0.6: strict IP discovery, GeoIP, timestamp and Kibana Data Views.
 Requires: pip install pandas requests tqdm
 Windows-only registry configuration. Run with Python on Windows.
+
+Kibana URL resolution: uses registry KIBANA_URL when set; otherwise probes the
+Elasticsearch hostname over http://:5601 then https://:5601 (and same-host
+fallbacks) and persists the first reachable URL back to the registry.
 """
 import ipaddress
 import fnmatch
@@ -286,7 +290,7 @@ def prepare_index(elastic, index_name, ip_fields, new_index):
         if existing_ts and existing_ts.get('type') not in ('date', 'date_nanos'):
             raise RuntimeError('Existing timestamp_field is not a date mapping; reindex required')
         if not existing_ts:
-            elastic.request('PUT', f'{index_name}/_mapping', json={'properties': {'timestamp_field': {'type': 'date'}}})
+            elastic.request('PUT', f'{index_name}/_mapping', json={'properties': {'timestamp_field': {'type': 'date'}})
         if not ip_fields:
             return
         geo = current.get('geoip', {})
@@ -363,10 +367,98 @@ def upload_csv(elastic, csv_path, index_name, new_index):
 
 
 def kibana_url_from_elasticsearch(elastic):
-    """Suggest Kibana's local port; permit an override for reverse proxies/HTTPS."""
+    """Build candidate Kibana base URLs from the Elasticsearch hostname.
+
+    Tries the common lab layout first (HTTP :5601), then HTTPS :5601, then
+    same-scheme / same-host variants so reverse proxies and TLS setups work
+    without a pre-configured KIBANA_URL.
+    """
     parts = urlsplit(elastic.url)
-    # Kibana commonly runs HTTP on 5601 even if Elasticsearch uses HTTPS on 9200.
-    return urlunsplit(('http', f'{parts.hostname}:5601', '', '', ''))
+    host = parts.hostname or 'localhost'
+    scheme = parts.scheme or 'https'
+    candidates = [
+        urlunsplit(('http', f'{host}:5601', '', '', '')),
+        urlunsplit(('https', f'{host}:5601', '', '', '')),
+    ]
+    # Same host/port as Elasticsearch is uncommon for Kibana but useful behind
+    # a reverse proxy that routes /app and /api to Kibana.
+    if parts.port and parts.port != 5601:
+        candidates.append(urlunsplit((scheme, f'{host}:{parts.port}', '', '', '')))
+    candidates.append(urlunsplit((scheme, host, '', '', '')))
+    # Deduplicate while preserving order
+    seen, ordered = set(), []
+    for url in candidates:
+        if url not in seen:
+            seen.add(url)
+            ordered.append(url)
+    return ordered
+
+
+def probe_kibana(elastic, kibana_url):
+    """Return True if Kibana responds at kibana_url (auth may still be required)."""
+    try:
+        response = elastic.session.request(
+            'GET',
+            kibana_url.rstrip('/') + '/api/status',
+            headers={'kbn-xsrf': 'csv2elk', 'Accept': 'application/json'},
+            timeout=min(15, TIMEOUT),
+        )
+        # Any HTTP response (including 401) means the service is reachable.
+        return response.status_code < 500
+    except requests.exceptions.RequestException:
+        return False
+
+
+def resolve_kibana_url(elastic):
+    """Resolve a working Kibana base URL: registry first, then auto-discovery.
+
+    Discovery order:
+      1. KIBANA_URL from HKCU registry (if present and reachable)
+      2. Elasticsearch hostname with http://:5601 then https://:5601 (and
+         same-host fallbacks)
+    On a successful probe the working URL is written back to the registry so
+    subsequent runs skip the probe. Failures are non-fatal for the upload.
+    """
+    registry_url = None
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REGISTRY_PATH) as key:
+            registry_url = str(winreg.QueryValueEx(key, 'KIBANA_URL')[0]).strip().rstrip('/')
+    except (FileNotFoundError, OSError):
+        pass
+
+    candidates = []
+    if registry_url and registry_url.startswith(('http://', 'https://')):
+        candidates.append(registry_url)
+    else:
+        if registry_url:
+            print(f'⚠️ Ignoring invalid registry KIBANA_URL: {registry_url!r}')
+        print('ℹ️ KIBANA_URL not set in registry; discovering from Elasticsearch hostname…')
+
+    for url in kibana_url_from_elasticsearch(elastic):
+        if url not in candidates:
+            candidates.append(url)
+
+    last_error = None
+    for url in candidates:
+        print(f'  🔎 Probing Kibana at {url} …')
+        if probe_kibana(elastic, url):
+            print(f'✅ Kibana reachable at {url}')
+            if url != registry_url:
+                try:
+                    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, REGISTRY_PATH, 0, winreg.KEY_WRITE) as key:
+                        winreg.SetValueEx(key, 'KIBANA_URL', 0, winreg.REG_SZ, url)
+                    print(f'✅ Saved KIBANA_URL to registry for future runs')
+                except OSError as exc:
+                    print(f'⚠️ Could not persist KIBANA_URL to registry: {exc}')
+            return url
+        last_error = f'no response from {url}'
+
+    print('❌ Unable to reach Kibana at any candidate URL.')
+    if last_error:
+        print(f'   Last attempt: {last_error}')
+    print(r'   Tip: set HKCU\Software\DFIRVault\CSV2ELK\KIBANA_URL to the correct base URL')
+    print('        (e.g. https://kibana.example.com:5601) and re-run.')
+    return None
 
 
 def kibana_request(elastic, kibana_url, method, path, **kwargs):
@@ -404,16 +496,9 @@ def offer_data_view(elastic, index_name):
     """
     print(f'\n🔎 Checking Kibana Data Views for {index_name}')
     print('ℹ️ A Kibana Data View is required to see uploaded data in the Discover analytics workspace.')
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REGISTRY_PATH) as key:
-            kibana_url = str(winreg.QueryValueEx(key, 'KIBANA_URL')[0]).strip().rstrip('/')
-    except (FileNotFoundError, OSError):
-        print('❌ Kibana URL is missing from the registry configuration.')
-        print(r'   Expected: HKCU\Software\DFIRVault\CSV2ELK -> KIBANA_URL')
+    kibana_url = resolve_kibana_url(elastic)
+    if not kibana_url:
         print('⚠️ Upload succeeded; Data View check was skipped.')
-        return
-    if not kibana_url.startswith(('http://', 'https://')):
-        print('❌ Invalid KIBANA_URL in registry. Data View check skipped.')
         return
 
     try:
