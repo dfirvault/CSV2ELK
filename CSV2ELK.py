@@ -52,9 +52,9 @@ TIMEOUT = 120
 
 def suggested_urls():
     hostname = socket.gethostname()
-    # User-requested defaults; deployments may use different ports.
-    return {'ELASTICSEARCH_URL': f'https://{hostname}:5601',
-            'KIBANA_URL': f'http://{hostname}:9200'}
+    # Standard Elasticsearch and Kibana ports; deployments can override these.
+    return {'ELASTICSEARCH_URL': f'https://{hostname}:9200',
+            'KIBANA_URL': f'http://{hostname}:5601'}
 
 
 def prompt_url(label, default):
@@ -166,34 +166,27 @@ def save_config(cfg):
 
 
 def connect_elasticsearch():
+    cfg = load_config()
     while True:
-        cfg = load_config()
         elastic = Elastic(cfg)
         try:
             elastic.request('GET', '_cluster/health')
             save_config(cfg)
             print(f"✅ Connected to Elasticsearch at {cfg['ELASTICSEARCH_URL']}")
             return elastic
-        except requests.exceptions.SSLError as exc:
-            print('❌ SSL connection error:', exc)
-            raise
         except Exception as exc:
+            elastic.session.close()
             print('❌ Elasticsearch connection failed:', exc)
-            if input('Re-enter connection details? [Y/n]: ').strip().lower() == 'n':
-                raise
-            # Only clear bad credentials in memory. Original registry values remain
-            # until a successful connection is established.
+            if isinstance(exc, requests.exceptions.SSLError):
+                print('ℹ️ Certificate verification is already disabled. WRONG_VERSION_NUMBER usually means HTTPS was sent to an HTTP endpoint.')
+                print('Typical URLs: Elasticsearch https://HOSTNAME:9200; Kibana http://HOSTNAME:5601.')
+                print('If Elasticsearch itself has TLS disabled, use http://HOSTNAME:9200.')
+            if input('Re-enter connection details? [Y/n]: ').strip().lower() in ('n', 'no'):
+                return None
             cfg['ELASTICSEARCH_URL'] = prompt_url('Elasticsearch URL', cfg['ELASTICSEARCH_URL'])
             cfg['KIBANA_URL'] = prompt_url('Kibana URL', cfg['KIBANA_URL'])
-            cfg['USERNAME'] = input('Username: ').strip() or cfg['USERNAME']
-            cfg['PASSWORD'] = masked_password('Password: ')
-            elastic = Elastic(cfg)
-            try:
-                elastic.request('GET', '_cluster/health')
-                save_config(cfg)
-                return elastic
-            except Exception as exc2:
-                print('❌ Connection still unsuccessful:', exc2)
+            cfg['USERNAME'] = input(f"Username [{cfg['USERNAME']}] (Enter to retain): ").strip() or cfg['USERNAME']
+            cfg['PASSWORD'] = masked_password('Password (Enter to retain): ') or cfg['PASSWORD']
 
 
 def sanitize_index_name(name):
@@ -1351,10 +1344,12 @@ def select_csv_file():
 def main():
     print('')
     print('Developed by Jacob Wilson - Version 1.0')
-    print('github.com/dfirvault/CSV2ELK')
     print('dfirvault@gmail.com')
     print('')
     elastic = connect_elasticsearch()
+    if elastic is None:
+        print('Connection cancelled.')
+        return
     while True:
         print('\n=== Elasticsearch CSV Uploader ===')
         print('1. Create new index and upload data')
