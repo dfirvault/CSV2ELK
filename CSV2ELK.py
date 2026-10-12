@@ -1,14 +1,12 @@
-"""CSV2ELK v0.6: strict IP discovery, GeoIP, timestamp and Kibana Data Views.
+"""CSV2ELK v0.7: strict IP discovery, GeoIP, timestamp and Kibana Data Views.
 Requires: pip install pandas requests tqdm
 Windows-only registry configuration. Run with Python on Windows.
-
-Kibana URL resolution: uses registry KIBANA_URL when set; otherwise probes the
-Elasticsearch hostname over http://:5601 then https://:5601 (and same-host
-fallbacks) and persists the first reachable URL back to the registry.
 """
+import webbrowser
+from getpass import getpass
 import ipaddress
 import fnmatch
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit, quote
 import json
 import os
 import re
@@ -32,7 +30,7 @@ TIMEOUT = 120
 
 def load_config():
     """Preserve the original CSV2ELK registry credential workflow."""
-    cfg = {'ELASTICSEARCH_URL': '', 'USERNAME': '', 'PASSWORD': ''}
+    cfg = {'ELASTICSEARCH_URL': '', 'USERNAME': '', 'PASSWORD': '', 'KIBANA_URL': ''}
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REGISTRY_PATH) as key:
             for name in cfg:
@@ -47,15 +45,15 @@ def load_config():
     if not cfg['USERNAME']:
         cfg['USERNAME'] = input('Username: ').strip()
     if not cfg['PASSWORD']:
-        cfg['PASSWORD'] = input('Password: ').strip()
+        cfg['PASSWORD'] = getpass('Password: ').strip()
     return cfg
 
 
 def save_config(cfg):
     """Maintain backwards compatibility with original HKCU settings."""
     with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, REGISTRY_PATH, 0, winreg.KEY_WRITE) as key:
-        for name in ('ELASTICSEARCH_URL', 'USERNAME', 'PASSWORD'):
-            winreg.SetValueEx(key, name, 0, winreg.REG_SZ, cfg[name])
+        for name in ('ELASTICSEARCH_URL', 'USERNAME', 'PASSWORD', 'KIBANA_URL'):
+            winreg.SetValueEx(key, name, 0, winreg.REG_SZ, cfg.get(name, ''))
 
 
 def connect_elasticsearch():
@@ -78,7 +76,7 @@ def connect_elasticsearch():
             # until a successful connection is established.
             cfg['ELASTICSEARCH_URL'] = input('Elasticsearch URL: ').strip() or cfg['ELASTICSEARCH_URL']
             cfg['USERNAME'] = input('Username: ').strip() or cfg['USERNAME']
-            cfg['PASSWORD'] = input('Password: ').strip()
+            cfg['PASSWORD'] = getpass('Password: ').strip()
             elastic = Elastic(cfg)
             try:
                 elastic.request('GET', '_cluster/health')
@@ -233,6 +231,7 @@ def clean_value(value):
 
 class Elastic:
     def __init__(self, cfg):
+        self.cfg = dict(cfg)
         self.url = cfg['ELASTICSEARCH_URL'].rstrip('/')
         self.session = requests.Session()
         self.session.auth = (cfg['USERNAME'], cfg['PASSWORD'])
@@ -256,39 +255,21 @@ class Elastic:
 
 def pipeline_definition(ip_fields):
     processors = []
-
     for field in ip_fields:
-        # Geographic enrichment
-        processors.append({
-            'geoip': {
-                'field': field,
-                'target_field': f'geoip.{field}',
-                'database_file': 'GeoLite2-City.mmdb',
-                'ignore_missing': True,
-                'ignore_failure': True
-            }
-        })
-
-        # ASN enrichment
-        processors.append({
-            'geoip': {
-                'field': field,
-                'target_field': f'asn.{field}',
-                'database_file': 'GeoLite2-ASN.mmdb',
-                'properties': [
-                    'asn',
-                    'organization_name',
-                    'network'
-                ],
-                'ignore_missing': True,
-                'ignore_failure': True
-            }
-        })
-
-    return {
-        'description': 'CSV2ELK GeoIP and ASN enrichment',
-        'processors': processors
-    }
+        # Target names are generated from sanitized CSV column names.
+        processors.append({'geoip': {
+            'field': field,
+            'target_field': f'geoip.{field}',
+            'ignore_missing': True,
+            'ignore_failure': True
+        }})
+        processors.append({'geoip': {
+            'field': field, 'target_field': f'asn.{field}',
+            'database_file': 'GeoLite2-ASN.mmdb',
+            'properties': ['asn', 'organization_name', 'network'],
+            'ignore_missing': True, 'ignore_failure': True
+        }})
+    return {'description': 'CSV2ELK per-upload geolocation and ASN', 'processors': processors}
 
 
 def geo_mapping(ip_fields):
@@ -296,6 +277,11 @@ def geo_mapping(ip_fields):
     if ip_fields:
         props['geoip'] = {'properties': {field: {'properties': {
             'location': {'type': 'geo_point'}
+        }} for field in ip_fields}}
+    if ip_fields:
+        props['asn'] = {'properties': {field: {'properties': {
+            'asn': {'type': 'long'}, 'organization_name': {'type': 'keyword'},
+            'network': {'type': 'keyword'}
         }} for field in ip_fields}}
     # Preserve original strings, including invalid/non-IP outliers; only map the derived location.
     return props
@@ -325,7 +311,7 @@ def prepare_index(elastic, index_name, ip_fields, new_index):
             loc = existing_fields.get(field, {}).get('properties', {}).get('location', {})
             if loc and loc.get('type') != 'geo_point':
                 raise RuntimeError(f'geoip.{field}.location is not geo_point in existing index')
-        elastic.request('PUT', f'{index_name}/_mapping', json={'properties': {'geoip': properties['geoip']}})
+        elastic.request('PUT', f'{index_name}/_mapping', json={'properties': {'geoip': properties['geoip'], 'asn': properties['asn']}})
 
 
 def upload_csv(elastic, csv_path, index_name, new_index):
@@ -344,7 +330,7 @@ def upload_csv(elastic, csv_path, index_name, new_index):
     else:
         print('⚠️ No exclusively-IP columns detected; importing without GeoIP enrichment')
     if input('Continue with these fields? [Y/n]: ').strip().lower() == 'n':
-        return False
+        return False, None
 
     # Each upload has its own pipeline; mapping is index-wide and extended per upload.
     pipeline_id = f'csv2elk_geoip_{index_name}_{uuid.uuid4().hex[:8]}' if ip_fields else None
@@ -355,6 +341,7 @@ def upload_csv(elastic, csv_path, index_name, new_index):
     print('✅ Index mapping ready')
 
     indexed, failed = 0, 0
+    time_min = time_max = None
     for offset in tqdm(range(0, len(df), CHUNK_DOCS), desc='📤 Uploading CSV'):
         rows = df.iloc[offset:offset + CHUNK_DOCS]
         lines = []
@@ -364,6 +351,9 @@ def upload_csv(elastic, csv_path, index_name, new_index):
                 parsed = parse_timestamp(record.get(timestamp))
                 if parsed:
                     record['timestamp_field'] = parsed
+                    instant = datetime.fromisoformat(parsed)
+                    time_min = instant if time_min is None else min(time_min, instant)
+                    time_max = instant if time_max is None else max(time_max, instant)
             # Preserve original evidence values, including malformed IPs.
             # GeoIP ignore_failure skips values it cannot enrich.
             lines.append(json.dumps({'index': {'_index': index_name}}, ensure_ascii=False))
@@ -386,103 +376,16 @@ def upload_csv(elastic, csv_path, index_name, new_index):
         print('🌍 Geo locations: ' + ', '.join(f'geoip.{f}.location' for f in ip_fields))
     if failed:
         print('⚠️ WARNING: Some documents failed; investigate errors before re-uploading.')
-    return indexed > 0
+    csv_time_range = (time_min.isoformat(), time_max.isoformat()) if time_min is not None else None
+    return indexed > 0, csv_time_range
 
 
 
 def kibana_url_from_elasticsearch(elastic):
-    """Build candidate Kibana base URLs from the Elasticsearch hostname.
-
-    Tries the common lab layout first (HTTP :5601), then HTTPS :5601, then
-    same-scheme / same-host variants so reverse proxies and TLS setups work
-    without a pre-configured KIBANA_URL.
-    """
+    """Suggest Kibana's local port; permit an override for reverse proxies/HTTPS."""
     parts = urlsplit(elastic.url)
-    host = parts.hostname or 'localhost'
-    scheme = parts.scheme or 'https'
-    candidates = [
-        urlunsplit(('http', f'{host}:5601', '', '', '')),
-        urlunsplit(('https', f'{host}:5601', '', '', '')),
-    ]
-    # Same host/port as Elasticsearch is uncommon for Kibana but useful behind
-    # a reverse proxy that routes /app and /api to Kibana.
-    if parts.port and parts.port != 5601:
-        candidates.append(urlunsplit((scheme, f'{host}:{parts.port}', '', '', '')))
-    candidates.append(urlunsplit((scheme, host, '', '', '')))
-    # Deduplicate while preserving order
-    seen, ordered = set(), []
-    for url in candidates:
-        if url not in seen:
-            seen.add(url)
-            ordered.append(url)
-    return ordered
-
-
-def probe_kibana(elastic, kibana_url):
-    """Return True if Kibana responds at kibana_url (auth may still be required)."""
-    try:
-        response = elastic.session.request(
-            'GET',
-            kibana_url.rstrip('/') + '/api/status',
-            headers={'kbn-xsrf': 'csv2elk', 'Accept': 'application/json'},
-            timeout=min(15, TIMEOUT),
-        )
-        # Any HTTP response (including 401) means the service is reachable.
-        return response.status_code < 500
-    except requests.exceptions.RequestException:
-        return False
-
-
-def resolve_kibana_url(elastic):
-    """Resolve a working Kibana base URL: registry first, then auto-discovery.
-
-    Discovery order:
-      1. KIBANA_URL from HKCU registry (if present and reachable)
-      2. Elasticsearch hostname with http://:5601 then https://:5601 (and
-         same-host fallbacks)
-    On a successful probe the working URL is written back to the registry so
-    subsequent runs skip the probe. Failures are non-fatal for the upload.
-    """
-    registry_url = None
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REGISTRY_PATH) as key:
-            registry_url = str(winreg.QueryValueEx(key, 'KIBANA_URL')[0]).strip().rstrip('/')
-    except (FileNotFoundError, OSError):
-        pass
-
-    candidates = []
-    if registry_url and registry_url.startswith(('http://', 'https://')):
-        candidates.append(registry_url)
-    else:
-        if registry_url:
-            print(f'⚠️ Ignoring invalid registry KIBANA_URL: {registry_url!r}')
-        print('ℹ️ KIBANA_URL not set in registry; discovering from Elasticsearch hostname…')
-
-    for url in kibana_url_from_elasticsearch(elastic):
-        if url not in candidates:
-            candidates.append(url)
-
-    last_error = None
-    for url in candidates:
-        print(f'  🔎 Probing Kibana at {url} …')
-        if probe_kibana(elastic, url):
-            print(f'✅ Kibana reachable at {url}')
-            if url != registry_url:
-                try:
-                    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, REGISTRY_PATH, 0, winreg.KEY_WRITE) as key:
-                        winreg.SetValueEx(key, 'KIBANA_URL', 0, winreg.REG_SZ, url)
-                    print(f'✅ Saved KIBANA_URL to registry for future runs')
-                except OSError as exc:
-                    print(f'⚠️ Could not persist KIBANA_URL to registry: {exc}')
-            return url
-        last_error = f'no response from {url}'
-
-    print('❌ Unable to reach Kibana at any candidate URL.')
-    if last_error:
-        print(f'   Last attempt: {last_error}')
-    print(r'   Tip: set HKCU\Software\DFIRVault\CSV2ELK\KIBANA_URL to the correct base URL')
-    print('        (e.g. https://kibana.example.com:5601) and re-run.')
-    return None
+    # Kibana commonly runs HTTP on 5601 even if Elasticsearch uses HTTPS on 9200.
+    return urlunsplit(('http', f'{parts.hostname}:5601', '', '', ''))
 
 
 def kibana_request(elastic, kibana_url, method, path, **kwargs):
@@ -513,85 +416,95 @@ def ask_number(prompt, count, allow_zero=True):
         print('❌ Invalid selection. Try again.')
 
 
-def offer_data_view(elastic, index_name):
-    """Automatically find a matching Kibana Data View, or offer to create one.
-
-    This is a post-upload convenience operation. Errors never roll back data.
-    """
-    print(f'\n🔎 Checking Kibana Data Views for {index_name}')
-    print('ℹ️ A Kibana Data View is required to see uploaded data in the Discover analytics workspace.')
-    kibana_url = resolve_kibana_url(elastic)
-    if not kibana_url:
-        print('⚠️ Upload succeeded; Data View check was skipped.')
-        return
-
+def configure_registry(elastic):
+    """Edit saved settings; validate new credentials before saving."""
+    cfg = dict(elastic.cfg)
+    for key, label in [('ELASTICSEARCH_URL', 'Elasticsearch URL'),
+                       ('USERNAME', 'Username'), ('KIBANA_URL', 'Kibana URL')]:
+        cfg[key] = input(f"{label} [{cfg.get(key, '')}] (Enter to retain): ").strip() or cfg.get(key, '')
+    cfg['PASSWORD'] = getpass('Password (Enter to retain): ').strip() or cfg['PASSWORD']
+    candidate = Elastic(cfg)
     try:
-        response = kibana_request(elastic, kibana_url, 'GET', 'data_views')
-        views = response.get('data_view', [])
-        if not isinstance(views, list):
-            raise RuntimeError('Unexpected Kibana Data Views API response')
-    except Exception as exc:
-        print(f'❌ Unable to query existing Kibana Data Views: {exc}')
-        print('⚠️ Uploaded documents remain in Elasticsearch. Check Kibana permissions and connectivity.')
-        return
+        candidate.request('GET', '_cluster/health')
+        save_config(cfg)
+    except Exception:
+        candidate.session.close()
+        raise
+    elastic.session.close()
+    print('✅ Configuration saved; new connection active.')
+    return candidate
 
-    matches = [v for v in views if view_matches_index(v.get('title', ''), index_name)]
-    if matches:
-        # Prefer an exact index, then a case-specific prefix, then general wildcards.
-        def specificity(view):
-            patterns = [x.strip() for x in view.get('title', '').split(',')
-                        if x.strip() and not x.strip().startswith('-')]
-            relevant = [x for x in patterns if fnmatch.fnmatchcase(index_name, x)]
-            return max(((int(x == index_name), len(x.replace('*', '').replace('?', '')),
-                         -x.count('*') - x.count('?')) for x in relevant),
-                       default=(0, 0, 0))
 
-        best = max(matches, key=specificity)
-        name = best.get('name') or best.get('title')
-        print(f'✅ Existing Kibana Data View found: {name} (pattern: {best.get("title")})')
-        print(f'✅ Confirmed pattern includes index: {index_name}')
-        if len(matches) > 1:
-            print(f'ℹ️ {len(matches)} matching Data Views found; showing the most specific match.')
-        print(f'🔎 In Kibana → Analytics → Discover, make sure the Data View "{name}" is selected.')
-        print('ℹ️ If documents are missing, check the Discover time filter and timestamp field.')
-        return
-
-    print(f'⚠️ No existing Kibana Data View matches index {index_name}.')
-    print('ℹ️ Create a Data View to see the uploaded data in Kibana Discover.')
-    print('   Example: an index named case0001_20261008 can use pattern case*')
-    print('   That pattern will also include future indices beginning with case.')
-    if input('Would you like to create a Data View now? [Y/n]: ').strip().lower() in ('n', 'no'):
-        print('ℹ️ You can create one later in Kibana → Stack Management → Data Views.')
-        return
-
-    suggested = index_name
-    pattern = input(f'Index pattern [{suggested}] (e.g. case*): ').strip() or suggested
-    if not view_matches_index(pattern, index_name):
-        print(f'❌ Pattern {pattern!r} does not match index {index_name!r}.')
-        print('⚠️ No Data View created; choose an exact index name or a matching wildcard.')
-        return
-    name = input(f'Data View name [{index_name}]: ').strip() or index_name
+def offer_data_view(elastic, index_name, csv_time_range=None):
+    """Resolve a matching time-based view, or offer creation; open Discover."""
+    print('ℹ️ A Data View is required to see uploaded data in Discover.')
+    kibana_url = elastic.cfg.get('KIBANA_URL', '').strip().rstrip('/')
+    if not kibana_url.startswith(('http://', 'https://')):
+        print('⚠️ Configure KIBANA_URL using menu option 4, then open Discover manually.')
+        return None
     try:
-        mapping = elastic.request('GET', f'{index_name}/_mapping')
-        props = mapping.get(index_name, {}).get('mappings', {}).get('properties', {})
-        has_timestamp = props.get('timestamp_field', {}).get('type') in ('date', 'date_nanos')
-        body = {'data_view': {'title': pattern, 'name': name}}
-        if has_timestamp:
-            body['data_view']['timeFieldName'] = 'timestamp_field'
-            print('📅 Timestamp field: timestamp_field')
+        data = kibana_request(elastic, kibana_url, 'GET', 'data_views')
+        views = data.get('data_view', [])
+        matches = [v for v in views if view_matches_index(v.get('title', ''), index_name)]
+        # Full metadata supplies the time field; list responses may omit it.
+        candidates = []
+        for view in matches:
+            full = kibana_request(elastic, kibana_url, 'GET',
+                                  'data_views/data_view/' + quote(view['id'], safe=''))['data_view']
+            candidates.append(full)
+        candidates.sort(key=lambda v: (v.get('timeFieldName') != 'timestamp_field',
+                                        v.get('title') != index_name, v.get('title', '')))
+        view = candidates[0] if candidates else None
+        if view and csv_time_range and view.get('timeFieldName') != 'timestamp_field':
+            print('⚠️ Matching view uses another time field; CSV time range needs timestamp_field.')
+            view = None
+        if view:
+            print(f"✅ Existing Data View found: {view.get('name') or view['title']} ({view['id']}).")
         else:
-            print('⚠️ No timestamp_field date mapping found; creating without a time filter.')
-        if input(f'Create Data View {name!r} with pattern {pattern!r}? [Y/n]: ').strip().lower() in ('n', 'no'):
-            print('ℹ️ Data View creation cancelled.')
-            return
-        created = kibana_request(elastic, kibana_url, 'POST', 'data_views/data_view', json=body)
-        view_id = created.get('data_view', {}).get('id', '(ID not returned)')
-        print(f'✅ Created Kibana Data View: {name} (ID: {view_id})')
-        print(f'✅ Confirmed index pattern {pattern!r} matches {index_name!r}.')
-        print(f'🔎 Open Kibana Discover and select the Data View "{name}".')
+            print(f'No suitable Data View found for {index_name}.')
+            print('Example: case* matches case_20261012 and case_other; the exact index is safest.')
+            if input('Add a Data View? [Y/n]: ').strip().lower() == 'n':
+                return None
+            pattern = input(f'Index pattern [{index_name}]: ').strip() or index_name
+            if not view_matches_index(pattern, index_name):
+                print('❌ Pattern does not match the uploaded index.')
+                return None
+            body = {'data_view': {'title': pattern, 'name': index_name}}
+            if csv_time_range:
+                body['data_view']['timeFieldName'] = 'timestamp_field'
+            view = kibana_request(elastic, kibana_url, 'POST', 'data_views/data_view', json=body)['data_view']
+            print(f"✅ Created Data View: {view['id']}")
+        url = discover_url(kibana_url, view['id'], index_name, csv_time_range)
+        print('🔎 Selecting this Data View in Discover: ' + url)
+        if csv_time_range:
+            print(f'📅 CSV time range: {csv_time_range[0]} to {csv_time_range[1]}')
+        else:
+            print('⚠️ No valid CSV timestamps; Discover uses its default time range.')
+        if not webbrowser.open_new(url):
+            print('⚠️ Browser could not open automatically. Use the URL above.')
+        return view['id']
     except Exception as exc:
-        print(f'❌ Kibana Data View creation failed: {exc}')
-        print('⚠️ Uploaded documents remain in Elasticsearch.')
+        print(f'⚠️ Discover setup failed: {exc}. Uploaded data remains in Elasticsearch.')
+        return None
+
+
+def rison_string(value):
+    return "'" + str(value).replace('!', '!!').replace("'", "!'") + "'"
+
+
+def discover_url(kibana_url, view_id, index_name, csv_time_range=None):
+    # Restrict a broad data view to the index uploaded in this operation.
+    query = '_index:' + json.dumps(index_name)
+    state = ("(columns:!(),dataSource:(dataViewId:" + rison_string(view_id) +
+             ",type:dataView),index:" + rison_string(view_id) +
+             ",filters:!(),query:(language:kuery,query:" + rison_string(query) + "))")
+    url = kibana_url.rstrip('/') + '/app/discover#/?_a=' + quote(state, safe='')
+    if csv_time_range:
+        start, end = csv_time_range
+        global_state = ("(filters:!(),refreshInterval:(pause:!t,value:0),time:(from:" +
+                        rison_string(start) + ",to:" + rison_string(end) + '))')
+        url += '&_g=' + quote(global_state, safe='')
+    return url
 
 
 def select_index(elastic):
@@ -625,7 +538,7 @@ def select_csv_file():
 
 def main():
     print('')
-    print('Developed by Jacob Wilson - Version 0.6')
+    print('Developed by Jacob Wilson - Version 0.8')
     print('dfirvault@gmail.com')
     print('')
     elastic = connect_elasticsearch()
@@ -634,11 +547,18 @@ def main():
         print('1. Create new index and upload data')
         print('2. Upload data to existing index')
         print('3. Manage index (delete)')
+        print('4. Configure registry settings (URLs, username, password)')
         print('0. Exit')
         choice = input('Enter choice: ').strip()
         if choice == '0':
             print('👋 Goodbye!')
             break
+        if choice == '4':
+            try:
+                elastic = configure_registry(elastic)
+            except Exception as exc:
+                print(f'❌ Configuration unchanged: {exc}')
+            continue
         if choice == '3':
             name = select_index(elastic)
             if name and input(f'Are you sure you want to delete {name}? (y/n): ').lower() in ('y', 'yes'):
@@ -665,9 +585,9 @@ def main():
             if not path:
                 print('⚠️ No file selected. Returning to menu.')
                 continue
-            uploaded = upload_csv(elastic, path, name, new_index)
+            uploaded, csv_time_range = upload_csv(elastic, path, name, new_index)
             if uploaded:
-                offer_data_view(elastic, name)
+                offer_data_view(elastic, name, csv_time_range)
         except Exception as exc:
             print(f'❌ UPLOAD STOPPED: {exc}')
 
