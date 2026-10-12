@@ -44,6 +44,9 @@ UPLOAD_BATCH_BYTES = 100 * 1024 * 1024  # Fixed 100 MiB payload cap.
 DEFAULT_UPLOAD_WORKERS = 2
 MAX_UPLOAD_WORKERS = 32
 BULK_429_RETRIES = 5
+BULK_READ_TIMEOUT = 600
+BULK_RETRY_WAIT = 15
+BULK_RETRY_MAX_WAIT = 60
 TIMEOUT = 120
 
 
@@ -361,7 +364,7 @@ class Elastic:
         self.session.headers.update({'Accept': 'application/json'})
 
     def request(self, method, path, **kwargs):
-        r = self.session.request(method, self.url + '/' + path.lstrip('/'), timeout=TIMEOUT, **kwargs)
+        r = self.session.request(method, self.url + '/' + path.lstrip('/'), timeout=kwargs.pop('timeout', TIMEOUT), **kwargs)
         if not r.ok:
             raise ElasticHTTPError(f'{method} {path}: HTTP {r.status_code}: {r.text[:3000]}', r.status_code)
         return r.json() if r.content else {}
@@ -577,27 +580,41 @@ class CSVStream:
                 print(f'⚠️ Skipping physical line {line}: {reason}')
 
 
-def bulk_documents(elastic, actions, pipeline=None):
-    """Retry only explicit 429 rejections; never replay successful documents."""
+def bulk_documents(elastic, actions, pipeline=None, retry_transport=False):
+    """Retry rejections; ambiguous network errors only for stable-ID index actions."""
+    if retry_transport:
+        for line in actions[::2]:
+            action = json.loads(line)
+            if list(action) != ['index'] or not action['index'].get('_id'):
+                raise ValueError('Network retries require index actions with explicit document IDs')
     pending = list(range(len(actions) // 2))
     good = [False] * len(pending)
     for attempt in range(BULK_429_RETRIES + 1):
+        reason = '429 rejection'
         batch = [line for i in pending for line in actions[2*i:2*i+2]]
         body = ('\n'.join(batch) + '\n').encode('utf-8')
         try:
             result = elastic.request('POST', '_bulk', params={'pipeline': pipeline} if pipeline else {},
-                                     data=body, headers={'Content-Type': 'application/x-ndjson'})
+                                     data=body, headers={'Content-Type': 'application/x-ndjson'},
+                                     timeout=(15, BULK_READ_TIMEOUT))
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            if not retry_transport or attempt == BULK_429_RETRIES:
+                raise
+            reason = type(exc).__name__
+            items = None
         except ElasticHTTPError as exc:
             if exc.status_code == 413 and len(pending) > 1:
                 middle = len(pending) // 2
                 tqdm.write('⚠️ Endpoint rejected payload size (413); splitting the rejected batch.')
                 for subset in (pending[:middle], pending[middle:]):
                     smaller = [line for i in subset for line in actions[2*i:2*i+2]]
-                    for i, ok in zip(subset, bulk_documents(elastic, smaller, pipeline)):
+                    for i, ok in zip(subset, bulk_documents(elastic, smaller, pipeline, retry_transport=retry_transport)):
                         good[i] = ok
                 return good
-            if exc.status_code != 429 or attempt == BULK_429_RETRIES:
+            retryable = exc.status_code == 429 or (retry_transport and exc.status_code in (502, 503, 504))
+            if not retryable or attempt == BULK_429_RETRIES:
                 raise
+            reason = f'HTTP {exc.status_code}'
             items = None
         else:
             items = result.get('items', [])
@@ -608,7 +625,7 @@ def bulk_documents(elastic, actions, pipeline=None):
             for i, item in zip(pending, items):
                 detail = next(iter(item.values()))
                 status = detail.get('status', 500)
-                if status == 429 and attempt < BULK_429_RETRIES:
+                if (status == 429 or (retry_transport and status in (502, 503, 504))) and attempt < BULK_429_RETRIES:
                     retry.append(i)
                     continue
                 good[i] = not detail.get('error') and 200 <= status < 300
@@ -618,8 +635,8 @@ def bulk_documents(elastic, actions, pipeline=None):
         if not pending:
             return good
         if attempt < BULK_429_RETRIES:
-            delay = min(16, 2 ** attempt) + random.uniform(0, 1)
-            tqdm.write(f'⚠️ Elasticsearch busy (429): retrying {len(pending):,} documents in {delay:.1f}s')
+            delay = min(BULK_RETRY_MAX_WAIT, BULK_RETRY_WAIT * 2 ** attempt)
+            tqdm.write(f'⚠️ {reason}: waiting {delay}s, then retry {attempt + 1}/{BULK_429_RETRIES} for {len(pending):,} documents')
             time.sleep(delay)
     return good
 
@@ -762,7 +779,9 @@ def upload_csv(elastic, csv_path, index_name, new_index):
     print(f'📦 Batch payload cap: {batch_limit / 1024**2:g} MiB; up to 50,000 documents per batch.')
     stream = CSVStream(csv_path, delimiter, encoding, recovery, log=True)
     rows = stream.rows()
-    indexed = failed = 0
+    indexed = failed = uncertain = 0
+    upload_id = uuid.uuid4().hex
+    row_number = 0
     time_min = time_max = None
     actions, times, batch_bytes = [], [], 0
     pending = deque()
@@ -775,16 +794,20 @@ def upload_csv(elastic, csv_path, index_name, new_index):
             worker_state.elastic = Elastic(elastic.cfg)
             worker_clients.append(worker_state.elastic)
         started = time.perf_counter()
-        results = bulk_documents(worker_state.elastic, batch, pipeline_id)
+        results = bulk_documents(worker_state.elastic, batch, pipeline_id, retry_transport=True)
         return results, time.perf_counter() - started
     workers = validated_workers(elastic.cfg.get('UPLOAD_WORKERS'))
     max_pending_batches = workers * 2
     pool = ThreadPoolExecutor(max_workers=workers)
     print(f'📤 Upload workers: {workers}; at most {max_pending_batches} batches queued/in flight')
     def collect():
-        nonlocal indexed, failed, time_min, time_max, bulk_seconds, completed_batches
+        nonlocal indexed, failed, uncertain, time_min, time_max, bulk_seconds, completed_batches
         future, batch_times = pending.popleft()
-        results, elapsed = future.result()
+        try:
+            results, elapsed = future.result()
+        except Exception:
+            uncertain += len(batch_times)
+            raise
         bulk_seconds += elapsed
         completed_batches += 1
         indexed += sum(results)
@@ -808,7 +831,7 @@ def upload_csv(elastic, csv_path, index_name, new_index):
         actions, times, batch_bytes = [], [], 0
         while pending and pending[0][0].done():
             collect()
-    bulk_action = json.dumps({'index': {'_index': index_name}}, separators=(',', ':'))
+    print(f'Network policy: {BULK_READ_TIMEOUT}s read timeout, {BULK_429_RETRIES} retries, waits 15/30/60/60/60s.')
     try:
         next(rows)  # header was already previewed
         with tqdm(total=os.path.getsize(csv_path), unit='B', unit_scale=True, desc='CSV read/upload') as bar:
@@ -817,6 +840,8 @@ def upload_csv(elastic, csv_path, index_name, new_index):
                 parsed = parse_timestamp(record.get(timestamp)) if timestamp else None
                 if parsed:
                     record['timestamp_field'] = parsed
+                row_number += 1
+                bulk_action = json.dumps({'index': {'_index': index_name, '_id': f'{upload_id}_{row_number}'}}, separators=(',', ':'))
                 pair = [bulk_action, json.dumps(record, ensure_ascii=False, separators=(',', ':'))]
                 size = sum(len(v.encode('utf-8')) + 1 for v in pair)
                 if size > batch_limit:
@@ -845,11 +870,26 @@ def upload_csv(elastic, csv_path, index_name, new_index):
             client.session.close()
         rows.close()
         elapsed = max(time.perf_counter() - upload_started, 0.001)
-        print(f'Upload totals: {indexed:,} indexed, {failed:,} failed, {stream.rejected:,} rejected CSV records')
+        print(f'Upload totals: {indexed:,} indexed, {failed:,} failed, {uncertain:,} uncertain, {stream.rejected:,} rejected CSV records')
         print(f'Average upload: {indexed / elapsed:,.0f} docs/s; mean bulk request: {bulk_seconds / max(completed_batches, 1):.2f}s')
+        if uncertain:
+            print('⚠️ Uncertain batches may already be indexed. Counters reflect confirmed responses only.')
         if stream.rejected:
             print('Rejected evidence log:', stream.log_path)
-    elastic.request('POST', f'{index_name}/_refresh')
+    for attempt in range(3):
+        try:
+            elastic.request('POST', f'{index_name}/_refresh', timeout=(15, BULK_READ_TIMEOUT))
+            break
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, ElasticHTTPError) as exc:
+            if isinstance(exc, ElasticHTTPError) and exc.status_code not in (429, 502, 503, 504):
+                print(f'⚠️ Documents uploaded, but refresh failed: {exc}')
+                break
+            if attempt == 2:
+                print(f'⚠️ Documents uploaded, but refresh could not be confirmed: {exc}')
+            else:
+                delay = BULK_RETRY_WAIT * (attempt + 1)
+                print(f'⚠️ Refresh delayed; retrying in {delay}s.')
+                time.sleep(delay)
     return indexed > 0, ((time_min.isoformat(), time_max.isoformat()) if time_min else None)
 
 
@@ -1311,6 +1351,7 @@ def select_csv_file():
 def main():
     print('')
     print('Developed by Jacob Wilson - Version 1.0')
+    print('github.com/dfirvault/CSV2ELK')
     print('dfirvault@gmail.com')
     print('')
     elastic = connect_elasticsearch()
