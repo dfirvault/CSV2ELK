@@ -256,15 +256,39 @@ class Elastic:
 
 def pipeline_definition(ip_fields):
     processors = []
+
     for field in ip_fields:
-        # Target names are generated from sanitized CSV column names.
-        processors.append({'geoip': {
-            'field': field,
-            'target_field': f'geoip.{field}',
-            'ignore_missing': True,
-            'ignore_failure': True
-        }})
-    return {'description': 'CSV2ELK per-upload IP geolocation', 'processors': processors}
+        # Geographic enrichment
+        processors.append({
+            'geoip': {
+                'field': field,
+                'target_field': f'geoip.{field}',
+                'database_file': 'GeoLite2-City.mmdb',
+                'ignore_missing': True,
+                'ignore_failure': True
+            }
+        })
+
+        # ASN enrichment
+        processors.append({
+            'geoip': {
+                'field': field,
+                'target_field': f'asn.{field}',
+                'database_file': 'GeoLite2-ASN.mmdb',
+                'properties': [
+                    'asn',
+                    'organization_name',
+                    'network'
+                ],
+                'ignore_missing': True,
+                'ignore_failure': True
+            }
+        })
+
+    return {
+        'description': 'CSV2ELK GeoIP and ASN enrichment',
+        'processors': processors
+    }
 
 
 def geo_mapping(ip_fields):
