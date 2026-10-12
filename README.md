@@ -3,7 +3,7 @@
 # CSV2ELK
 Intended for DFIR and Incident Response, this is a simple tool that uploads CSV files to ELK
 
-# CSV2ELK v0.1
+# CSV2ELK v1.0
 **Bulk CSV-to-Elasticsearch Importer for DFIR & Threat Hunting**  
 *Author: Jacob Wilson | [dfirvault@gmail.com](mailto:dfirvault@gmail.com)*  
 
@@ -26,7 +26,8 @@ Intended for DFIR and Incident Response, this is a simple tool that uploads CSV 
 pip install pandas requests tqdm
 ```
 ## Example
-![image](https://github.com/user-attachments/assets/559a79a9-fc6c-43c6-b11e-2d3a126fcc5a)
+<img width="506" height="246" alt="image" src="https://github.com/user-attachments/assets/27e17ef6-2ce9-4830-b1d7-a8fcbfcaaa4f" />
+
 
 ## 👤 Author
 
