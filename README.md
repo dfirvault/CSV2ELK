@@ -26,8 +26,7 @@ Intended for DFIR and Incident Response, this is a simple tool that uploads CSV 
 pip install pandas requests tqdm
 ```
 ## Example
-<img width="506" height="246" alt="image" src="https://github.com/user-attachments/assets/27e17ef6-2ce9-4830-b1d7-a8fcbfcaaa4f" />
-
+<img width="506" height="246" alt="image" src="https://github.com/user-attachments/assets/85e81692-bed4-474d-9425-006f3a4c0868" />
 
 ## 👤 Author
 
