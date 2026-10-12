@@ -15,7 +15,7 @@ Intended for DFIR and Incident Response, this is a simple tool that uploads CSV 
 
 ## 🔥 Features
 - **Drag-and-drop CSV ingestion** to Elasticsearch/OpenSearch  
-- **Auto-mapping** for timestamps, IPs, and forensic fields  
+- **Auto-mapping** for timestamps, IPs, ASN / Organisation, and other forensic fields  
 - **Configurable credentials** (saved securely in `config.txt`)  
 - **DFIR-optimized**: Handles malware logs, firewall data, and SIEM exports  
 - **Smart timestamp detection** (supports Unix epoch, ISO8601, and more)  
